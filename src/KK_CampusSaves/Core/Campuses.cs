@@ -100,7 +100,11 @@ namespace Joojkk.CampusSaves
     /// <summary>All the campuses, and the single background thread that does the slow work with them.</summary>
     internal static class Campuses
     {
-        public static string Root { get { return Path.Combine(UserData.Path, "save/campus"); } }
+        /// <summary>A test run has its own vault and slots: the same campus name must never lead it to the player's.</summary>
+        public static readonly bool Testing = File.Exists(Path.Combine(BepInEx.Paths.ConfigPath, "joojkk.autotest.txt"));
+        public const string TestSlots = "joojkk_";
+
+        public static string Root { get { return Path.Combine(UserData.Path, Testing ? "save/campus_test" : "save/campus"); } }
         public static string GameDir { get { return SaveData.Path; } }
         public static readonly List<Campus> All = new List<Campus>();
         public static volatile string Status = "";
@@ -124,6 +128,20 @@ namespace Joojkk.CampusSaves
                     if (c != null) All.Add(c);
                 }
             }
+            Run(FillCards);
+        }
+
+        /// <summary>Versions from before the cards were counted, for the ones whose file is still the same in a slot.</summary>
+        private static void FillCards()
+        {
+            foreach (var c in Snapshot())
+                foreach (var v in c.Vault.Snapshot().Where(x => x.Cards == 0))
+                {
+                    var path = Path.Combine(GameDir, v.Slot != "" ? v.Slot : c.Slot);
+                    if (c.Slot == "" && v.Slot == "" || !File.Exists(path) || File.GetLastWriteTimeUtc(path).Ticks != v.HeadTicks) continue;
+                    v.Cards = SaveHeader.Cards(path);
+                    if (v.Cards > 0) c.Vault.MarkCards(v);
+                }
         }
 
         public static List<Campus> Snapshot() { lock (All) return All.ToList(); }
@@ -229,12 +247,20 @@ namespace Joojkk.CampusSaves
             return v;
         }
 
+        /// <summary>Removes a file even when something left it read-only.</summary>
+        public static void Erase(string path)
+        {
+            if (!File.Exists(path)) return;
+            File.SetAttributes(path, FileAttributes.Normal);
+            File.Delete(path);
+        }
+
         /// <summary>The next free slot, the way the game names them.</summary>
         public static string FreeSlot()
         {
             for (var i = 1; i <= 100; i++)
             {
-                var name = "file" + i.ToString("00") + ".dat";
+                var name = (Testing ? TestSlots + "slot" : "file") + i.ToString("00") + ".dat";
                 if (!File.Exists(Path.Combine(GameDir, name))) return name;
             }
             return null;
@@ -252,6 +278,57 @@ namespace Joojkk.CampusSaves
         {
             var h = Read(path);
             return h != null ? (ActionGame.Cycle.Week)Math.Min(h.Week, 6) + ", Night" : "Night";
+        }
+
+        /// <summary>
+        /// How many heroines a save holds. The count stands behind the player's card, which has to be walked over: nothing
+        /// here reads the card itself, so this is fast on a save of any size. 0 when the file is not a save of this shape.
+        /// </summary>
+        public static int Cards(string path)
+        {
+            try
+            {
+                using (var r = new BinaryReader(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096)))
+                {
+                    var version = new Version(r.ReadString());
+                    r.ReadString();
+                    if (version >= new Version(0, 0, 5)) r.ReadInt32();
+                    r.ReadBoolean();
+                    r.ReadInt32();
+                    SkipPlayer(r, version);
+                    var n = r.ReadInt32();
+                    return n >= 0 && n < 1000 ? n : 0;
+                }
+            }
+            catch { return 0; }
+        }
+
+        private static void SkipPlayer(BinaryReader r, Version version)
+        {
+            r.ReadInt32();
+            r.ReadInt32();
+            SkipCard(r);
+            r.ReadInt32();
+            r.ReadInt32();
+            r.ReadString();
+            r.BaseStream.Seek(16, SeekOrigin.Current);
+            if (version >= new Version(0, 0, 1)) r.BaseStream.Seek(12, SeekOrigin.Current);
+            if (version >= new Version(0, 0, 2)) r.BaseStream.Seek(4, SeekOrigin.Current);
+            if (version >= new Version(0, 0, 9)) r.BaseStream.Seek(4, SeekOrigin.Current);
+            if (version >= new Version(0, 0, 12)) r.BaseStream.Seek(4, SeekOrigin.Current);
+        }
+
+        /// <summary>A card inside a save: the same walk as ChaFile.LoadFile, down to the size of its blocks.</summary>
+        private static void SkipCard(BinaryReader r)
+        {
+            var png = PngFile.GetPngSize(r);
+            if (png != 0L) r.BaseStream.Seek(png, SeekOrigin.Current);
+            r.ReadInt32();
+            r.ReadString();
+            r.ReadString();
+            r.BaseStream.Seek(r.ReadInt32(), SeekOrigin.Current);
+            r.BaseStream.Seek(r.ReadInt32(), SeekOrigin.Current);
+            r.BaseStream.Seek(r.ReadInt64(), SeekOrigin.Current);
         }
 
         public static SaveHeader Read(string path)

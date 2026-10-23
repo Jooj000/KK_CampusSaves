@@ -40,7 +40,7 @@ namespace Joojkk.CampusSaves
         }
 
         protected override void OnNewGame() { SaveFlow.CampusId = null; }
-        protected override void OnPeriodChange(Cycle.Type period) { SaveFlow.Trigger(CampusSavesPlugin.OnPeriod.Value ? "period" : null); }
+        protected override void OnPeriodChange(Cycle.Type period) { if (!SaveFlow.Returning) SaveFlow.Trigger(CampusSavesPlugin.OnPeriod.Value ? "period" : null); }
         protected override void OnEnterNightMenu() { SaveFlow.Trigger(CampusSavesPlugin.OnDayEnd.Value ? "day end" : null); }
         protected override void OnStartH(MonoBehaviour proc, HFlag hFlag, bool vr) { SaveFlow.Dirty = true; }
         protected override void OnEndH(MonoBehaviour proc, HFlag hFlag, bool vr) { SaveFlow.Trigger(CampusSavesPlugin.AfterH.Value ? "after H" : null); }
@@ -66,6 +66,9 @@ namespace Joojkk.CampusSaves
         private static float _resumeAt = -1f;
         private static string[] _resumeData;
         private static bool _armed, _warping;
+
+        /// <summary>On the way back to a moment of the day: the period that starts now is the one that was saved.</summary>
+        public static bool Returning { get { return _resumeAt >= 0f; } }
 
         private static string GamePath { get { return Path.GetFullPath(Campuses.GameDir).TrimEnd('/', '\\'); } }
 
@@ -139,7 +142,7 @@ namespace Joojkk.CampusSaves
                 if (!fi.Exists || fi.Length < 1024 || SaveHeader.Read(tmp) == null) throw new IOException("the new save is not whole");
                 if (!Campuses.WaitIdle(120000)) throw new IOException("the background work did not finish");
                 var old = head + ".old";
-                if (File.Exists(old)) File.Delete(old);
+                Campuses.Erase(old);
                 if (File.Exists(head)) File.Move(head, old);
                 File.Move(tmp, head);
                 Absorb(slot, head, old);
@@ -159,7 +162,7 @@ namespace Joojkk.CampusSaves
         private static void Absorb(string slot, string head, string old)
         {
             var c = Campuses.ById(CampusId);
-            if (c == null) { if (File.Exists(old)) File.Delete(old); return; }
+            if (c == null) { Campuses.Erase(old); return; }
             if (c.Slot != slot) { c.Slot = slot; c.Write(); }
             var kind = NextKind;
             var v = new SaveVersion { Kind = kind, Trigger = NextTrigger, At = DateTime.Now, Resume = _resume ?? "", HeadTicks = File.GetLastWriteTimeUtc(head).Ticks, Name = Label(), Day = DayNow(), Place = PlaceNow() };
@@ -175,7 +178,7 @@ namespace Joojkk.CampusSaves
                     var known = c.Vault.Versions.LastOrDefault();
                     if (known == null || File.GetLastWriteTimeUtc(old).Ticks != known.HeadTicks)
                         c.Vault.Absorb(old, new SaveVersion { Name = SaveHeader.Label(old), Kind = "imported", Trigger = "found", At = File.GetLastWriteTime(old), HeadTicks = File.GetLastWriteTimeUtc(old).Ticks, Parent = known != null ? known.Id : 0 });
-                    File.Delete(old);
+                    Campuses.Erase(old);
                 }
                 var prev = c.Vault.Versions.LastOrDefault();
                 v.Parent = prev != null ? prev.Id : 0;
@@ -306,6 +309,21 @@ namespace Joojkk.CampusSaves
             return "Saved";
         }
 
+        /// <summary>From the Save screen: into a campus, which becomes the one this game follows, or into a new one.</summary>
+        public static string SaveInto(Campus c)
+        {
+            var game = Singleton<Game>.Instance;
+            var slot = c != null && c.Slot != "" ? c.Slot : Campuses.FreeSlot();
+            if (slot == null) return "No free slot";
+            if (c == null) c = Campuses.Create(game.saveData.accademyName, game.saveData.emblemID, slot);
+            CampusId = c.Id;
+            NextKind = "manual";
+            NextTrigger = "";
+            Game.SaveFileName = slot;
+            game.Save(slot);
+            return "Saved";
+        }
+
         public static void Tick()
         {
             if (_resumeAt >= 0f) TickResume();
@@ -328,6 +346,34 @@ namespace Joojkk.CampusSaves
         {
             try { if (CampusSavesPlugin.OverLoad.Value) SavesPanel.OpenOver(__instance); }
             catch (Exception e) { CampusSavesPlugin.Log.LogWarning("Load screen: " + e.Message); }
+        }
+
+        /// <summary>The game's Save screen, in the night menu, does the same.</summary>
+        [HarmonyPostfix]
+        [HarmonyPatch(typeof(SaveScene), "Start")]
+        private static void SaveScreen(SaveScene __instance)
+        {
+            try { if (CampusSavesPlugin.OverLoad.Value) SavesPanel.OpenOver(__instance); }
+            catch (Exception e) { CampusSavesPlugin.Log.LogWarning("Save screen: " + e.Message); }
+        }
+
+        /// <summary>
+        /// The game's Quit screen, in story mode, gives way to the menu at once: with that screen open a second Esc ends the
+        /// game, so its No is pressed here and only the menu stays. Everywhere else the screen works as usual.
+        /// </summary>
+        [HarmonyPostfix]
+        [HarmonyPatch(typeof(ExitScene), "Start")]
+        private static void QuitScreen(ExitScene __instance)
+        {
+            try
+            {
+                if (!CampusSavesPlugin.EscMenu.Value || !PauseMenu.InStory) return;
+                var t = Traverse.Create(__instance);
+                t.Field("canvas").GetValue<Canvas>().enabled = false;
+                t.Field("No").GetValue<UnityEngine.UI.Button>().onClick.Invoke();
+                PauseMenu.Toggle();
+            }
+            catch (Exception e) { CampusSavesPlugin.Log.LogWarning("Quit screen: " + e.Message); }
         }
 
         [HarmonyPrefix]
@@ -381,9 +427,22 @@ namespace Joojkk.CampusSaves
                 t.Property("_nowType").SetValue(type);
                 t.Field("timeCtrl").Property("timeZone").SetValue(t.Method("TimeZoonCast", type).GetValue());
                 _resumeAt = Time.realtimeSinceStartup;
+                TellCampusLife(type);
                 CampusSavesPlugin.Log.LogInfo("Coming back to " + type);
             }
             catch (Exception e) { _resumeAt = -1f; CampusSavesPlugin.Log.LogWarning("Resume: " + e.Message); }
+        }
+
+        /// <summary>The way back goes through the game's period start, which to Campus Life would be a new period: it hears first.</summary>
+        private static void TellCampusLife(Cycle.Type type)
+        {
+            try
+            {
+                var t = AccessTools.TypeByName("Joojkk.CampusLife.Campus");
+                var m = t != null ? AccessTools.Method(t, "DayResumed") : null;
+                if (m != null) m.Invoke(null, new object[] { (int)type });
+            }
+            catch (Exception e) { CampusSavesPlugin.Log.LogWarning("Campus Life notice: " + e.Message); }
         }
 
         private static void TickResume()
